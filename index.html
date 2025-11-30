@@ -678,8 +678,73 @@
             );
         };
 
-        const ScanPage = ({ onComplete }) => {
-            const [produce, setProduce] = useState(produceOptions[0].value);
+        const callGeminiAPI = async (imageBase64, apiKey, retryCount = 0) => {
+            try {
+                const base64Data = imageBase64.split(',')[1] || imageBase64;
+                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        contents: [{
+                            parts: [
+                                {
+                                    text: `Analyze this produce image and return ONLY a valid JSON object with the following structure:
+{
+  "produceType": "banana|apple|avocado|tomato|orange|strawberry|mango",
+  "ripeness": 1-5,
+  "freshness": 1-5,
+  "defects": "No defects! 👍" or "Minor defects detected ⚠️",
+  "shelfLife": "5-7 days" or "3-4 days" or "1-2 days" or "Sell today",
+  "confidence": 85-98
+}
+
+Be precise and return only the JSON, no other text.`
+                                },
+                                {
+                                    inline_data: {
+                                        mime_type: "image/jpeg",
+                                        data: base64Data
+                                    }
+                                }
+                            ]
+                        }]
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`API error: ${response.status}`);
+                }
+
+                const data = await response.json();
+                const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                
+                // Extract JSON from response (handle markdown code blocks)
+                const jsonMatch = text.match(/\{[\s\S]*\}/);
+                if (!jsonMatch) {
+                    throw new Error('No JSON found in response');
+                }
+                
+                const analysis = JSON.parse(jsonMatch[0]);
+                
+                // Validate and normalize
+                if (!analysis.produceType || !analysis.ripeness || !analysis.freshness) {
+                    throw new Error('Invalid analysis data');
+                }
+                
+                return analysis;
+            } catch (error) {
+                if (retryCount < 1) {
+                    // Retry once
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    return callGeminiAPI(imageBase64, apiKey, retryCount + 1);
+                }
+                throw error;
+            }
+        };
+
+        const ScanPage = ({ onComplete, apiKey }) => {
             const [price, setPrice] = useState("");
             const [imageData, setImageData] = useState(defaultImage);
             const [fileName, setFileName] = useState("Sample image");
@@ -698,30 +763,42 @@
             reader.readAsDataURL(file);
             };
 
-            const runAnalysis = () => {
-                const selected = produceOptions.find((opt) => opt.value === produce);
-                if (!selected) {
-                    setError("Choose a produce item before scanning.");
+            const runAnalysis = async () => {
+                if (!apiKey) {
+                    setError("Please enter your Gemini API key in Settings first.");
                     return;
                 }
+
+                if (imageData === defaultImage) {
+                    setError("Please upload an image to analyze.");
+                    return;
+                }
+
                 setError("");
                 setAnalyzing(true);
 
-                const delay = 1100 + Math.random() * 800;
-            setTimeout(() => {
-                    const ripeness = weightedStar();
-                    const freshness = weightedStar();
+                try {
+                    const geminiResult = await callGeminiAPI(imageData, apiKey);
+                    
+                    // Find produce match or use detected type
+                    const detectedProduce = produceOptions.find(
+                        opt => opt.value === geminiResult.produceType.toLowerCase()
+                    ) || produceOptions[0]; // fallback to first option
+                    
+                    const ripeness = Math.max(1, Math.min(5, Math.round(geminiResult.ripeness)));
+                    const freshness = Math.max(1, Math.min(5, Math.round(geminiResult.freshness)));
                     const avgStars = (ripeness + freshness) / 2;
-                    const defects = Math.random() < 0.9 ? "No defects! 👍" : "Minor defects detected ⚠️";
-                    const shelfLife = shelfLifeFromStars(avgStars);
+                    const defects = geminiResult.defects || "No defects! 👍";
+                    const shelfLife = geminiResult.shelfLife || shelfLifeFromStars(avgStars);
                     const recommendation = discountFromStars(avgStars);
-                    const confidence = Math.floor(Math.random() * 10) + 89;
+                    const confidence = Math.max(85, Math.min(98, Math.round(geminiResult.confidence || 92)));
                     const originalPrice = parseFloat(price) || 0;
                     const newPrice = originalPrice ? originalPrice * (1 - recommendation.discount / 100) : 0;
-                const recipes = getRecipeIdeas(selected.value, avgStars);
+                    const recipes = getRecipeIdeas(detectedProduce.value, avgStars);
+                    
                     const analysis = {
                         id: Date.now(),
-                        produce: selected,
+                        produce: detectedProduce,
                         ripeness,
                         freshness,
                         defects,
@@ -733,27 +810,21 @@
                         imageData,
                         fileName,
                         timestamp: new Date().toLocaleString(),
-                    summary: summaryCopy(selected, shelfLife, recommendation, defects),
-                    recipes
+                        summary: summaryCopy(detectedProduce, shelfLife, recommendation, defects),
+                        recipes
                     };
+                    
                     onComplete(analysis);
                     setAnalyzing(false);
                     navigate("/results");
-                }, delay);
+                } catch (err) {
+                    setError(`Analysis failed: ${err.message}. Please check your API key and try again.`);
+                    setAnalyzing(false);
+                }
             };
 
             return h("div", { className: "grid", style: { gap: "20px" } },
                 h("div", { className: "panel grid" },
-                    h("div", null,
-                        h("label", { htmlFor: "produce-select" }, "Produce Type"),
-                        h("select", {
-                            id: "produce-select",
-                            value: produce,
-                            onChange: (e) => setProduce(e.target.value)
-                        }, produceOptions.map((opt) =>
-                            h("option", { key: opt.value, value: opt.value }, `${opt.icon} ${opt.label}`)
-                        ))
-                    ),
                     h("div", null,
                         h("label", { htmlFor: "price-input" }, "Original Price ($)"),
                         h("input", {
@@ -992,13 +1063,51 @@
             );
         };
 
-        const SettingsPage = () =>
-            h("div", { className: "grid", style: { gap: "16px" } },
+        const SettingsPage = ({ apiKey, onApiKeyChange }) => {
+            const [localKey, setLocalKey] = useState(apiKey || "");
+            useEffect(() => {
+                setLocalKey(apiKey || "");
+            }, [apiKey]);
+            return h("div", { className: "grid", style: { gap: "16px" } },
+                h("div", { className: "page-title" }, "Settings"),
+                h("div", { className: "analysis-card" },
+                    h("h3", null, "Gemini API Key"),
+                    h("p", { style: { fontSize: "14px", color: "#7f736a", marginBottom: "12px" } }, 
+                        "Enter your Google Gemini API key to enable AI-powered produce analysis. Get your key at https://aistudio.google.com/app/apikey"
+                    ),
+                    h("input", {
+                        type: "password",
+                        placeholder: "Enter your Gemini API key",
+                        value: localKey,
+                        onChange: (e) => setLocalKey(e.target.value),
+                        style: {
+                            width: "100%",
+                            padding: "12px",
+                            borderRadius: "12px",
+                            border: "1px solid var(--border)",
+                            fontSize: "15px",
+                            fontFamily: "monospace"
+                        }
+                    }),
+                    h("button", {
+                        className: "primary-btn",
+                        style: { marginTop: "12px" },
+                        onClick: () => {
+                            if (onApiKeyChange) {
+                                onApiKeyChange(localKey.trim());
+                                alert("API key saved!");
+                            } else {
+                                alert("Error: API key handler not available");
+                            }
+                        }
+                    }, "Save API Key"),
+                    apiKey && h("p", { style: { marginTop: "8px", fontSize: "13px", color: "#3bb273", fontWeight: 600 } }, "✓ API key configured")
+                ),
                 h("div", { className: "page-title" }, "How to Use"),
                 h("div", { className: "analysis-card" },
                     h("ol", { style: { paddingLeft: "18px", lineHeight: 1.6 } },
-                        h("li", null, "Select produce type & enter original price."),
-                        h("li", null, "Capture or upload a clear photo."),
+                        h("li", null, "Enter original price & upload a clear photo."),
+                        h("li", null, "AI will automatically detect produce type and assess freshness."),
                         h("li", null, "Review automated assessment & pricing recommendation."),
                         h("li", null, "Apply discount to sync with in-store labels.")
                     )
@@ -1016,11 +1125,12 @@
                 ),
                 h("div", { className: "analysis-card" },
                     h("h3", null, "About"),
-                    h("p", null, "Prototype tool demonstrating freshness insights, pricing guidance, and waste reduction for grocery teams. No real computer vision is performed."),
+                    h("p", null, "Prototype tool demonstrating freshness insights, pricing guidance, and waste reduction for grocery teams. Uses Google Gemini 2.0 Flash for AI-powered produce analysis."),
                     h("p", { style: { marginTop: "12px", fontWeight: 600 } }, "Cornell Tech Product Studio · Team 23"),
                     h("p", null, "Authors: Wuchen Li, Matt Shapiro, Audrey Tjokro, Michael Twersky, Vishali Vallioor")
                 )
             );
+        };
 
         const App = () => {
             const [history, setHistory] = useState(() => {
@@ -1031,10 +1141,25 @@
                 }
             });
             const [result, setResult] = useState(null);
+            const [apiKey, setApiKey] = useState(() => {
+                try {
+                    return localStorage.getItem("gemini-api-key") || "";
+                } catch {
+                    return "";
+                }
+            });
 
             useEffect(() => {
                 localStorage.setItem("produce-history", JSON.stringify(history));
             }, [history]);
+
+            useEffect(() => {
+                if (apiKey) {
+                    localStorage.setItem("gemini-api-key", apiKey);
+                } else {
+                    localStorage.removeItem("gemini-api-key");
+                }
+            }, [apiKey]);
 
             const handleScanComplete = (analysis) => {
                 setResult(analysis);
@@ -1047,7 +1172,7 @@
                 }
             };
 
-            const ScanRoute = () => h(ScanPage, { onComplete: handleScanComplete });
+            const ScanRoute = () => h(ScanPage, { onComplete: handleScanComplete, apiKey });
 
             const ResultsRoute = () => {
                 const navigate = useNavigate();
@@ -1060,7 +1185,7 @@
 
             const HistoryRoute = () => h(HistoryPage, { history, onClear: clearHistory });
             const DashboardRoute = () => h(DashboardPage, { history });
-            const SettingsRoute = () => h(SettingsPage);
+            const SettingsRoute = () => h(SettingsPage, { apiKey, onApiKeyChange: setApiKey });
 
             return h(HashRouter, null,
                 h("div", { className: "app-shell" },
